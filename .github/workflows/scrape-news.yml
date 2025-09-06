@@ -2,7 +2,7 @@ name: Scrape RSS Feeds
 
 on:
   schedule:
-    - cron: '0 12 * * *'  # Every day at 6:00 UTC
+  #  - cron: '0 12 * * *'  # Every day at 6:00 UTC
   workflow_dispatch:      # Manual trigger
 
 jobs:
