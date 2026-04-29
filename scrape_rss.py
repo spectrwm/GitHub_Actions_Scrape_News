@@ -3,51 +3,76 @@ import json
 from datetime import datetime, time, timezone
 from bs4 import BeautifulSoup
 
-# Set cutoff to today at 00:00 UTC
+# Cutoff (optional filtering)
 now = datetime.now(timezone.utc)
 cutoff_time = datetime.combine(now.date(), time(0, 0), tzinfo=timezone.utc)
 
-# Load RSS feed URLs
 with open("rss_feeds.txt") as f:
     urls = [line.strip() for line in f if line.strip()]
 
-# Collect news
+
+def parse_date(entry):
+    """
+    Try all possible RSS/Atom date fields safely
+    Returns datetime or None
+    """
+    # structured parsed dates
+    for key in ["published_parsed", "updated_parsed"]:
+        if hasattr(entry, key):
+            value = getattr(entry, key)
+            if value:
+                return datetime(*value[:6], tzinfo=timezone.utc)
+
+    # fallback string parsing
+    for key in ["published", "updated"]:
+        if hasattr(entry, key):
+            try:
+                return datetime(*feedparser._parse_date(getattr(entry, key))[:6], tzinfo=timezone.utc)
+            except Exception:
+                pass
+
+    return None
+
+
+def get_summary(entry):
+    summary = (
+        entry.get("summary")
+        or entry.get("description")
+        or (entry.content[0].value if hasattr(entry, "content") and entry.content else "")
+        or ""
+    )
+    return BeautifulSoup(summary, "html.parser").get_text().strip()
+
+
 all_news = []
 
 for url in urls:
     feed = feedparser.parse(url)
 
+    if not feed.entries:
+        print(f"⚠️ Empty feed: {url}")
+        continue
+
     for entry in feed.entries:
-        if 'published_parsed' in entry and entry.published_parsed:
-            published_dt = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+        published_dt = parse_date(entry)
 
-            if published_dt: #> cutoff_time:
-                summary = ""
+        # optional filtering (safe even if None)
+        if published_dt and published_dt <= cutoff_time:
+            continue
 
-                if "summary" in entry:
-                    summary = entry.summary
-                elif "description" in entry:
-                    summary = entry.description
-                elif "content" in entry and len(entry.content) > 0:
-                    summary = entry.content[0].value
+        all_news.append({
+            "title": entry.get("title", "").strip(),
+            "link": entry.get("link", ""),
+            "published": published_dt.isoformat() if published_dt else None,
+            "source": feed.feed.get("title", url),
+            "summary": get_summary(entry)
+        })
 
-                # Clean HTML
-                summary = BeautifulSoup(summary, "html.parser").get_text()
+print(f"✅ Collected {len(all_news)} articles")
 
-                all_news.append({
-                    "title": entry.get("title"),
-                    "link": entry.get("link"),
-                    "published": published_dt.isoformat(),
-                    "source": feed.feed.get("title", url),
-                    "summary": summary
-                })
-
-# Save to JSON
 with open("news.json", "w", encoding="utf-8") as f:
     json.dump({
         "cutoff": cutoff_time.isoformat(),
-        "last_updated": datetime.utcnow().isoformat() + "Z",
+        "last_updated": datetime.now(timezone.utc).isoformat(),
         "news": all_news
     }, f, indent=2, ensure_ascii=False)
-
-print(f"✅ Scraped {len(all_news)} items published after {cutoff_time.isoformat()}.")
