@@ -2,11 +2,8 @@ import feedparser
 import requests
 from bs4 import BeautifulSoup
 import json
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
-import trafilatura
 from urllib.parse import urlparse, urljoin, urlunparse, parse_qsl, urlencode
-import time
+import trafilatura
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -14,58 +11,53 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 # CONFIG
 # -----------------------------
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)",
-    "Accept": "*/*"
+    "User-Agent": "Mozilla/5.0 (compatible; NewsBot/2.0)"
 }
 
 seen_articles = set()
 
 # -----------------------------
-# FETCH (HTTP SAFE)
+# FETCH
 # -----------------------------
 def fetch(url, timeout=15):
     try:
-        r = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
+        r = requests.get(url, headers=HEADERS, timeout=timeout)
         if r.status_code != 200:
             return None
         return r.text
     except Exception:
         return None
 
-
 # -----------------------------
-# URL NORMALIZATION
+# NORMALIZE URL
 # -----------------------------
 def normalize_url(url):
     try:
         parsed = urlparse(url)
         clean = [(k, v) for k, v in parse_qsl(parsed.query) if not k.startswith("utm")]
         return urlunparse(parsed._replace(query=urlencode(clean)))
-    except Exception:
+    except:
         return url
 
-
 # -----------------------------
-# DETECT CONTENT TYPE
+# DETECT TYPE
 # -----------------------------
 def detect_type(text):
     if not text:
         return "unknown"
 
-    t = text.strip().lower()
-
+    t = text.lower()
     if "<rss" in t or "<feed" in t:
         return "rss"
-    if "<html" in t or "<!doctype html" in t:
+    if "<html" in t:
         return "html"
     if "<?xml" in t:
         return "xml"
 
     return "unknown"
 
-
 # -----------------------------
-# RSS HANDLER
+# RSS
 # -----------------------------
 def parse_rss(url):
     text = fetch(url)
@@ -76,39 +68,101 @@ def parse_rss(url):
         return None
 
     feed = feedparser.parse(text)
-    if not feed.entries:
-        return None
-
-    return feed
-
+    return feed if feed.entries else None
 
 # -----------------------------
-# SITEMAP DETECTION
+# WORDPRESS API (🔥 KEY)
+# -----------------------------
+def try_wordpress_api(base_url):
+    api = base_url.rstrip("/") + "/wp-json/wp/v2/posts?per_page=20"
+
+    try:
+        r = requests.get(api, headers=HEADERS, timeout=10)
+        if r.status_code != 200:
+            return []
+
+        data = r.json()
+        results = []
+
+        for post in data:
+            link = post.get("link")
+            title = post.get("title", {}).get("rendered", "")
+
+            if link:
+                results.append({
+                    "title": BeautifulSoup(title, "html.parser").get_text(),
+                    "link": link,
+                    "summary": "",
+                    "source": base_url
+                })
+
+        if results:
+            print("🧠 WordPress API used")
+
+        return results
+
+    except:
+        return []
+
+# -----------------------------
+# SITEMAP (ADVANCED)
 # -----------------------------
 def try_sitemap(base_url):
     root = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
-    sitemap_urls = [
-        root + "/sitemap.xml",
-        root + "/sitemap_index.xml",
-        root + "/wp-sitemap.xml"
+
+    sitemap_paths = [
+        "/sitemap.xml",
+        "/sitemap_index.xml",
+        "/wp-sitemap.xml",
+        "/post-sitemap.xml"
     ]
 
-    for sm in sitemap_urls:
-        xml = fetch(sm)
-        if not xml or "<url" not in xml.lower():
+    links = []
+
+    for path in sitemap_paths:
+        xml = fetch(root + path)
+        if not xml:
             continue
 
         soup = BeautifulSoup(xml, "xml")
-        links = [loc.text for loc in soup.find_all("loc") if loc.text]
 
-        if links:
-            return links[:20]
+        # nested sitemap
+        if soup.find_all("sitemap"):
+            for loc in soup.find_all("loc"):
+                sub = fetch(loc.text)
+                if not sub:
+                    continue
 
-    return []
+                sub_soup = BeautifulSoup(sub, "xml")
+                for u in sub_soup.find_all("loc"):
+                    links.append(u.text)
 
+        else:
+            for loc in soup.find_all("loc"):
+                links.append(loc.text)
+
+    if links:
+        print("🧠 Sitemap used")
+
+    return links[:30]
 
 # -----------------------------
-# HTML LINK SCRAPER (FAST)
+# ARTICLE FILTER
+# -----------------------------
+def is_article_url(url):
+    u = url.lower()
+
+    bad = ["category", "tag", "page", "author", "login", "contact"]
+    if any(b in u for b in bad):
+        return False
+
+    if any(x in u for x in ["202", "/news/", "/article/", "/post/"]):
+        return True
+
+    return len(u.split("/")) > 5
+
+# -----------------------------
+# HTML CRAWL
 # -----------------------------
 def crawl_html(base_url):
     html = fetch(base_url)
@@ -124,27 +178,18 @@ def crawl_html(base_url):
         if urlparse(link).netloc != urlparse(base_url).netloc:
             continue
 
-        if any(x in link.lower() for x in [
-            "login", "signup", "tag", "category",
-            "privacy", "about", "contact"
-        ]):
-            continue
+        if is_article_url(link):
+            links.add(link)
 
-        links.add(link)
-
-    return list(links)[:15]
-
+    return list(links)[:20]
 
 # -----------------------------
-# PLAYWRIGHT (ONLY LAST RESORT)
+# JS CRAWL (LAST RESORT)
 # -----------------------------
 def crawl_js(url):
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox"]
-            )
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
             page = browser.new_page()
 
             page.goto(url, timeout=20000, wait_until="domcontentloaded")
@@ -154,68 +199,71 @@ def crawl_js(url):
             browser.close()
 
             soup = BeautifulSoup(html, "html.parser")
-
             links = set()
+
             for a in soup.find_all("a", href=True):
                 link = urljoin(url, a["href"])
 
                 if urlparse(link).netloc != urlparse(url).netloc:
                     continue
 
-                links.add(link)
+                if is_article_url(link):
+                    links.add(link)
 
-            return list(links)[:15]
+            return list(links)[:20]
 
     except PlaywrightTimeoutError:
-        print(f"⏱️ Playwright timeout: {url}")
+        print("⏱️ Playwright timeout")
         return []
     except Exception as e:
         print(f"❌ Playwright error: {e}")
         return []
 
-
 # -----------------------------
 # ARTICLE EXTRACTION
 # -----------------------------
 def extract_article(url):
-    downloaded = trafilatura.fetch_url(url)
-    if not downloaded:
+    try:
+        downloaded = trafilatura.fetch_url(url)
+        if not downloaded:
+            return ""
+        text = trafilatura.extract(downloaded)
+        return text.strip() if text else ""
+    except:
         return ""
 
-    text = trafilatura.extract(downloaded)
-    return text.strip() if text else ""
-
-
 # -----------------------------
-# SMART ROUTER (IMPORTANT FIX)
+# SMART ROUTER
 # -----------------------------
 def resolve(url):
     print(f"\n🔎 Processing: {url}")
 
-    # 1. RSS FIRST (IMPORTANT FIX)
+    # 1. RSS
     feed = parse_rss(url)
     if feed:
         print("✅ RSS detected")
         return ("rss", feed, url)
 
-    # 2. sitemap (FAST)
-    sitemap_links = try_sitemap(url)
-    if sitemap_links:
-        print("🧠 Using sitemap")
-        return ("sitemap", sitemap_links, url)
+    # 2. WordPress API
+    wp = try_wordpress_api(url)
+    if wp:
+        return ("wp", wp, url)
 
-    # 3. HTML crawl
-    links = crawl_html(url)
-    if links:
+    # 3. Sitemap
+    sm = try_sitemap(url)
+    if sm:
+        return ("links", sm, url)
+
+    # 4. HTML
+    html_links = crawl_html(url)
+    if html_links:
         print("🧠 HTML crawl")
-        return ("html", links, url)
+        return ("links", html_links, url)
 
-    # 4. JS fallback ONLY IF NECESSARY
+    # 5. JS
     print("🧠 JS fallback")
     js_links = crawl_js(url)
-
-    return ("js", js_links, url)
-
+    return ("links", js_links, url)
 
 # -----------------------------
 # MAIN PIPELINE
@@ -224,27 +272,29 @@ def run(urls):
     all_news = []
 
     for url in urls:
-
         mode, data, base = resolve(url)
 
-        # ---------------- RSS ----------------
         if mode == "rss":
-            for entry in data.entries:
-                link = normalize_url(entry.get("link", ""))
+            for e in data.entries:
+                link = normalize_url(e.get("link", ""))
+
                 if link in seen_articles:
                     continue
                 seen_articles.add(link)
 
                 all_news.append({
-                    "title": entry.get("title", ""),
+                    "title": e.get("title", ""),
                     "link": link,
-                    "summary": entry.get("summary", "")[:500],
+                    "summary": e.get("summary", "")[:500],
                     "source": base
                 })
 
-        # ---------------- SITEMAP / HTML / JS ----------------
+        elif mode == "wp":
+            all_news.extend(data)
+
         else:
             for link in data:
+                link = normalize_url(link)
 
                 if link in seen_articles:
                     continue
@@ -265,7 +315,6 @@ def run(urls):
 
     with open("news.json", "w", encoding="utf-8") as f:
         json.dump(all_news, f, ensure_ascii=False, indent=2)
-
 
 # -----------------------------
 # RUN
