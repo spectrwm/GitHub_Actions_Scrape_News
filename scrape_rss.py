@@ -226,8 +226,8 @@ def crawl_site(url, limit=15):
             # filter noise
             if any(x in full.lower() for x in [
                 "login", "signup", "tag", "category",
-                "privacy", "about", "contact", "#", "author"
-            ]:
+                "privacy", "about", "contact", "#"
+            ]):
                 continue
 
             # keep likely articles
