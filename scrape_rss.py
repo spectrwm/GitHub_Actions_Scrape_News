@@ -1,5 +1,5 @@
-import requests
 import feedparser
+import requests
 from bs4 import BeautifulSoup
 import json
 import time
@@ -7,7 +7,6 @@ import random
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
 import trafilatura
-from collections import defaultdict
 from playwright.sync_api import sync_playwright
 
 # -------------------------
@@ -15,34 +14,21 @@ from playwright.sync_api import sync_playwright
 # -------------------------
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-    "Accept": "text/html,application/xml;q=0.9,*/*;q=0.8"
+    "Accept": "text/html,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9"
 }
 
 MAX_RETRIES = 3
+BACKOFF_BASE = 2
 TIMEOUT = 15
 
 seen_articles = set()
-domain_last_request = defaultdict(float)
-
-# -------------------------
-# RATE LIMIT (per domain)
-# -------------------------
-def rate_limit(url, delay=1.5):
-    domain = urlparse(url).netloc
-    elapsed = time.time() - domain_last_request[domain]
-
-    if elapsed < delay:
-        time.sleep(delay - elapsed)
-
-    domain_last_request[domain] = time.time()
 
 
 # -------------------------
-# FETCH
+# FETCH (retry + backoff)
 # -------------------------
 def fetch(url):
-    rate_limit(url)
-
     for attempt in range(MAX_RETRIES):
         try:
             r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
@@ -51,75 +37,115 @@ def fetch(url):
                 return r.text
 
             if r.status_code in [429, 500, 502, 503]:
-                raise Exception("retry")
+                raise Exception(f"Retry {r.status_code}")
 
             return None
 
         except Exception:
-            time.sleep(2 ** attempt + random.random())
+            sleep_time = BACKOFF_BASE ** attempt + random.uniform(0.5, 1.5)
+            print(f"⚠️ Retry {attempt+1} in {sleep_time:.1f}s → {url}")
+            time.sleep(sleep_time)
 
     return None
 
 
 # -------------------------
-# CMS DETECTION
+# GOOGLE CACHE
 # -------------------------
-def detect_wordpress_api(url):
-    parsed = urlparse(url)
-    api_url = f"{parsed.scheme}://{parsed.netloc}/wp-json/wp/v2/posts"
-
-    data = fetch(api_url)
-
-    if data and data.strip().startswith("["):
-        print("🧠 WordPress API detected")
-        return api_url
-
-    return None
+def fetch_google_cache(url):
+    cache_url = f"https://webcache.googleusercontent.com/search?q=cache:{url}"
+    print(f"🌐 Google cache: {url}")
+    return fetch(cache_url)
 
 
 # -------------------------
-# WORDPRESS FETCH
+# TYPE DETECTION
 # -------------------------
-def fetch_wordpress(api_url):
-    data = fetch(api_url)
+def detect_type(text):
+    if not text:
+        return "none"
 
-    if not data:
-        return []
+    t = text.lower()
 
-    posts = json.loads(data)
-    results = []
+    if "<rss" in t or "<feed" in t:
+        return "rss"
+    if "<urlset" in t:
+        return "sitemap"
+    if "<html" in t:
+        return "html"
 
-    for p in posts[:20]:
-        link = p.get("link")
+    return "unknown"
 
-        if not link or link in seen_articles:
-            continue
 
-        seen_articles.add(link)
+# -------------------------
+# SMART JS DETECTOR
+# -------------------------
+def needs_js_rendering(html):
+    if not html:
+        return True
 
-        results.append({
-            "title": BeautifulSoup(p["title"]["rendered"], "html.parser").text,
-            "link": link,
-            "summary": BeautifulSoup(p["excerpt"]["rendered"], "html.parser").text,
-            "source": api_url
-        })
+    soup = BeautifulSoup(html, "html.parser")
+    links = soup.find_all("a")
 
-    return results
+    if len(links) < 8:
+        return True
+
+    if len(html) < 5000:
+        return True
+
+    text = html.lower()
+
+    if any(x in text for x in [
+        "__next_data__", "__nuxt__", "id=\"root\"", "react", "vue"
+    ]):
+        return True
+
+    return False
+
+
+# -------------------------
+# PLAYWRIGHT
+# -------------------------
+def fetch_rendered(url):
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage"
+                ]
+            )
+
+            context = browser.new_context(
+                user_agent=HEADERS["User-Agent"],
+                viewport={"width": 1280, "height": 800}
+            )
+
+            page = context.new_page()
+            page.goto(url, timeout=20000, wait_until="domcontentloaded")
+            page.wait_for_timeout(1500)
+
+            html = page.content()
+            browser.close()
+
+            return html
+
+    except Exception as e:
+        print(f"⚠️ Playwright failed → {url} ({e})")
+        return None
 
 
 # -------------------------
 # RSS
 # -------------------------
-def parse_rss(url):
-    text = fetch(url)
-    if not text:
-        return []
-
+def parse_rss(text, source):
     feed = feedparser.parse(text)
     results = []
 
-    for e in feed.entries:
-        link = e.get("link")
+    for entry in feed.entries:
+        link = entry.get("link")
 
         if not link or link in seen_articles:
             continue
@@ -127,13 +153,21 @@ def parse_rss(url):
         seen_articles.add(link)
 
         results.append({
-            "title": e.get("title", ""),
+            "title": entry.get("title", ""),
             "link": link,
-            "summary": e.get("summary", ""),
-            "source": url
+            "summary": entry.get("summary", ""),
+            "source": source
         })
 
     return results
+
+
+# -------------------------
+# SITEMAP
+# -------------------------
+def parse_sitemap(text):
+    soup = BeautifulSoup(text, "xml")
+    return [loc.text for loc in soup.find_all("loc")][:20]
 
 
 # -------------------------
@@ -149,10 +183,12 @@ def extract_links(base_url, html):
         if urlparse(full).netloc != urlparse(base_url).netloc:
             continue
 
-        if len(full.split("/")) < 4:
+        if any(x in full.lower() for x in [
+            "category", "tag", "login", "about", "contact", "#"
+        ]):
             continue
 
-        if any(x in full.lower() for x in ["tag", "category", "login"]):
+        if len(full.split("/")) < 4:
             continue
 
         links.add(full)
@@ -161,7 +197,7 @@ def extract_links(base_url, html):
 
 
 # -------------------------
-# ARTICLE
+# ARTICLE EXTRACTION
 # -------------------------
 def extract_article(url):
     downloaded = trafilatura.fetch_url(url)
@@ -172,62 +208,58 @@ def extract_article(url):
 
 
 # -------------------------
-# PLAYWRIGHT POOL
-# -------------------------
-class BrowserPool:
-    def __init__(self):
-        self.p = sync_playwright().start()
-        self.browser = self.p.chromium.launch(headless=True)
-        self.context = self.browser.new_context()
-
-    def fetch(self, url):
-        try:
-            page = self.context.new_page()
-            page.goto(url, timeout=20000, wait_until="domcontentloaded")
-            page.wait_for_timeout(1000)
-            html = page.content()
-            page.close()
-            return html
-        except:
-            return None
-
-    def close(self):
-        self.browser.close()
-        self.p.stop()
-
-
-browser_pool = BrowserPool()
-
-
-# -------------------------
 # MAIN ROUTER
 # -------------------------
 def process_url(url):
-    print(f"\n🔎 {url}")
+    print(f"\n🔎 Processing: {url}")
 
-    # 1. Try RSS directly
-    rss = parse_rss(url)
-    if rss:
-        print("✅ RSS")
-        return rss
-
-    # 2. WordPress API
-    wp_api = detect_wordpress_api(url)
-    if wp_api:
-        return fetch_wordpress(wp_api)
-
-    # 3. HTML
     html = fetch(url)
 
     if not html:
-        print("⚠️ HTML failed → Playwright")
-        html = browser_pool.fetch(url)
+        html = fetch_google_cache(url)
 
     if not html:
+        print("❌ Failed completely")
         return []
 
-    links = extract_links(url, html)
+    page_type = detect_type(html)
 
+    # ✅ RSS
+    if page_type == "rss":
+        print("✅ RSS detected")
+        return parse_rss(html, url)
+
+    # ✅ SITEMAP
+    if page_type == "sitemap":
+        print("🧭 Sitemap detected")
+
+        links = parse_sitemap(html)
+        results = []
+
+        for link in links:
+            content = extract_article(link)
+
+            if content:
+                results.append({
+                    "title": link.split("/")[-1],
+                    "link": link,
+                    "summary": content[:500],
+                    "source": url
+                })
+
+        return results
+
+    # 🧠 HTML
+    print("🧠 HTML detected")
+
+    if needs_js_rendering(html):
+        print("⚡ Smart Playwright triggered")
+        rendered = fetch_rendered(url)
+
+        if rendered:
+            html = rendered
+
+    links = extract_links(url, html)
     results = []
 
     for link in links[:15]:
@@ -238,9 +270,9 @@ def process_url(url):
 
         content = extract_article(link)
 
-        # fallback → Playwright
+        # 🔥 per-article fallback
         if not content or len(content) < 200:
-            rendered = browser_pool.fetch(link)
+            rendered = fetch_rendered(link)
 
             if rendered:
                 content = trafilatura.extract(rendered) or ""
@@ -268,7 +300,8 @@ def main():
     all_news = []
 
     for url in urls:
-        all_news.extend(process_url(url))
+        articles = process_url(url)
+        all_news.extend(articles)
 
     print(f"\n✅ Collected: {len(all_news)}")
 
@@ -277,8 +310,6 @@ def main():
             "updated": datetime.now(timezone.utc).isoformat(),
             "news": all_news
         }, f, indent=2, ensure_ascii=False)
-
-    browser_pool.close()
 
 
 if __name__ == "__main__":
