@@ -7,6 +7,7 @@ import random
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
 import trafilatura
+from playwright.sync_api import sync_playwright
 
 # -------------------------
 # CONFIG
@@ -25,7 +26,7 @@ seen_articles = set()
 
 
 # -------------------------
-# SMART FETCH (retry + backoff)
+# FETCH (retry + backoff)
 # -------------------------
 def fetch(url):
     for attempt in range(MAX_RETRIES):
@@ -35,26 +36,25 @@ def fetch(url):
             if r.status_code == 200:
                 return r.text
 
-            # retry only on temporary errors
             if r.status_code in [429, 500, 502, 503]:
-                raise Exception(f"Retryable error {r.status_code}")
+                raise Exception(f"Retry {r.status_code}")
 
             return None
 
-        except Exception as e:
+        except Exception:
             sleep_time = BACKOFF_BASE ** attempt + random.uniform(0.5, 1.5)
-            print(f"⚠️ Retry {attempt+1} for {url} in {sleep_time:.1f}s")
+            print(f"⚠️ Retry {attempt+1} in {sleep_time:.1f}s → {url}")
             time.sleep(sleep_time)
 
     return None
 
 
 # -------------------------
-# GOOGLE CACHE FALLBACK
+# GOOGLE CACHE
 # -------------------------
 def fetch_google_cache(url):
     cache_url = f"https://webcache.googleusercontent.com/search?q=cache:{url}"
-    print(f"🌐 Trying Google cache: {url}")
+    print(f"🌐 Google cache: {url}")
     return fetch(cache_url)
 
 
@@ -69,10 +69,8 @@ def detect_type(text):
 
     if "<rss" in t or "<feed" in t:
         return "rss"
-
     if "<urlset" in t:
         return "sitemap"
-
     if "<html" in t:
         return "html"
 
@@ -80,15 +78,75 @@ def detect_type(text):
 
 
 # -------------------------
-# RSS PARSER
+# SMART JS DETECTOR
+# -------------------------
+def needs_js_rendering(html):
+    if not html:
+        return True
+
+    soup = BeautifulSoup(html, "html.parser")
+    links = soup.find_all("a")
+
+    if len(links) < 8:
+        return True
+
+    if len(html) < 5000:
+        return True
+
+    text = html.lower()
+
+    if any(x in text for x in [
+        "__next_data__", "__nuxt__", "id=\"root\"", "react", "vue"
+    ]):
+        return True
+
+    return False
+
+
+# -------------------------
+# PLAYWRIGHT
+# -------------------------
+def fetch_rendered(url):
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage"
+                ]
+            )
+
+            context = browser.new_context(
+                user_agent=HEADERS["User-Agent"],
+                viewport={"width": 1280, "height": 800}
+            )
+
+            page = context.new_page()
+            page.goto(url, timeout=20000, wait_until="domcontentloaded")
+            page.wait_for_timeout(1500)
+
+            html = page.content()
+            browser.close()
+
+            return html
+
+    except Exception as e:
+        print(f"⚠️ Playwright failed → {url} ({e})")
+        return None
+
+
+# -------------------------
+# RSS
 # -------------------------
 def parse_rss(text, source):
     feed = feedparser.parse(text)
-
     results = []
 
     for entry in feed.entries:
         link = entry.get("link")
+
         if not link or link in seen_articles:
             continue
 
@@ -105,7 +163,7 @@ def parse_rss(text, source):
 
 
 # -------------------------
-# SITEMAP PARSER
+# SITEMAP
 # -------------------------
 def parse_sitemap(text):
     soup = BeautifulSoup(text, "xml")
@@ -113,7 +171,7 @@ def parse_sitemap(text):
 
 
 # -------------------------
-# HTML LINK EXTRACTOR
+# HTML LINKS
 # -------------------------
 def extract_links(base_url, html):
     soup = BeautifulSoup(html, "html.parser")
@@ -139,17 +197,14 @@ def extract_links(base_url, html):
 
 
 # -------------------------
-# ARTICLE EXTRACTOR
+# ARTICLE EXTRACTION
 # -------------------------
 def extract_article(url):
     downloaded = trafilatura.fetch_url(url)
-
     if not downloaded:
         return ""
 
-    text = trafilatura.extract(downloaded)
-
-    return text or ""
+    return trafilatura.extract(downloaded) or ""
 
 
 # -------------------------
@@ -160,7 +215,6 @@ def process_url(url):
 
     html = fetch(url)
 
-    # try cache if blocked
     if not html:
         html = fetch_google_cache(url)
 
@@ -170,17 +224,21 @@ def process_url(url):
 
     page_type = detect_type(html)
 
+    # ✅ RSS
     if page_type == "rss":
         print("✅ RSS detected")
         return parse_rss(html, url)
 
-    elif page_type == "sitemap":
+    # ✅ SITEMAP
+    if page_type == "sitemap":
         print("🧭 Sitemap detected")
-        links = parse_sitemap(html)
 
+        links = parse_sitemap(html)
         results = []
+
         for link in links:
             content = extract_article(link)
+
             if content:
                 results.append({
                     "title": link.split("/")[-1],
@@ -188,41 +246,52 @@ def process_url(url):
                     "summary": content[:500],
                     "source": url
                 })
-        return results
-
-    elif page_type == "html":
-        print("🧠 HTML fallback")
-
-        links = extract_links(url, html)
-
-        results = []
-        for link in links[:15]:
-            if link in seen_articles:
-                continue
-
-            seen_articles.add(link)
-
-            content = extract_article(link)
-
-            if not content or len(content) < 200:
-                continue
-
-            results.append({
-                "title": link.split("/")[-1],
-                "link": link,
-                "summary": content[:500],
-                "source": url
-            })
 
         return results
 
-    else:
-        print("❓ Unknown format")
-        return []
+    # 🧠 HTML
+    print("🧠 HTML detected")
+
+    if needs_js_rendering(html):
+        print("⚡ Smart Playwright triggered")
+        rendered = fetch_rendered(url)
+
+        if rendered:
+            html = rendered
+
+    links = extract_links(url, html)
+    results = []
+
+    for link in links[:15]:
+        if link in seen_articles:
+            continue
+
+        seen_articles.add(link)
+
+        content = extract_article(link)
+
+        # 🔥 per-article fallback
+        if not content or len(content) < 200:
+            rendered = fetch_rendered(link)
+
+            if rendered:
+                content = trafilatura.extract(rendered) or ""
+
+        if not content or len(content) < 200:
+            continue
+
+        results.append({
+            "title": link.split("/")[-1],
+            "link": link,
+            "summary": content[:500],
+            "source": url
+        })
+
+    return results
 
 
 # -------------------------
-# RUN PIPELINE
+# MAIN
 # -------------------------
 def main():
     with open("rss_feeds.txt") as f:
