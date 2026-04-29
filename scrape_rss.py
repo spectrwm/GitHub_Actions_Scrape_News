@@ -5,7 +5,7 @@ from bs4 import BeautifulSoup
 
 # Set cutoff to today at 00:00 UTC
 now = datetime.now(timezone.utc)
-cutoff_time = datetime.combine(now.date(), time(9, 0), tzinfo=timezone.utc)
+cutoff_time = datetime.combine(now.date(), time(0, 0), tzinfo=timezone.utc)
 
 # Load RSS feed URLs
 with open("rss_feeds.txt") as f:
