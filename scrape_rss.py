@@ -2,325 +2,246 @@ import feedparser
 import requests
 from bs4 import BeautifulSoup
 import json
-from urllib.parse import urlparse, urljoin, urlunparse, parse_qsl, urlencode
+import time
+import random
+from datetime import datetime, timezone
+from urllib.parse import urljoin, urlparse
 import trafilatura
 
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-
-# -----------------------------
+# -------------------------
 # CONFIG
-# -----------------------------
+# -------------------------
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; NewsBot/2.0)"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+    "Accept": "text/html,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9"
 }
+
+MAX_RETRIES = 3
+BACKOFF_BASE = 2
+TIMEOUT = 15
 
 seen_articles = set()
 
-# -----------------------------
-# FETCH
-# -----------------------------
-def fetch(url, timeout=15):
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=timeout)
-        if r.status_code != 200:
+
+# -------------------------
+# SMART FETCH (retry + backoff)
+# -------------------------
+def fetch(url):
+    for attempt in range(MAX_RETRIES):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+
+            if r.status_code == 200:
+                return r.text
+
+            # retry only on temporary errors
+            if r.status_code in [429, 500, 502, 503]:
+                raise Exception(f"Retryable error {r.status_code}")
+
             return None
-        return r.text
-    except Exception:
-        return None
 
-# -----------------------------
-# NORMALIZE URL
-# -----------------------------
-def normalize_url(url):
-    try:
-        parsed = urlparse(url)
-        clean = [(k, v) for k, v in parse_qsl(parsed.query) if not k.startswith("utm")]
-        return urlunparse(parsed._replace(query=urlencode(clean)))
-    except:
-        return url
+        except Exception as e:
+            sleep_time = BACKOFF_BASE ** attempt + random.uniform(0.5, 1.5)
+            print(f"⚠️ Retry {attempt+1} for {url} in {sleep_time:.1f}s")
+            time.sleep(sleep_time)
 
-# -----------------------------
-# DETECT TYPE
-# -----------------------------
+    return None
+
+
+# -------------------------
+# GOOGLE CACHE FALLBACK
+# -------------------------
+def fetch_google_cache(url):
+    cache_url = f"https://webcache.googleusercontent.com/search?q=cache:{url}"
+    print(f"🌐 Trying Google cache: {url}")
+    return fetch(cache_url)
+
+
+# -------------------------
+# TYPE DETECTION
+# -------------------------
 def detect_type(text):
     if not text:
-        return "unknown"
+        return "none"
 
     t = text.lower()
+
     if "<rss" in t or "<feed" in t:
         return "rss"
+
+    if "<urlset" in t:
+        return "sitemap"
+
     if "<html" in t:
         return "html"
-    if "<?xml" in t:
-        return "xml"
 
     return "unknown"
 
-# -----------------------------
-# RSS
-# -----------------------------
-def parse_rss(url):
-    text = fetch(url)
-    if not text:
-        return None
 
-    if detect_type(text) not in ["rss", "xml"]:
-        return None
-
+# -------------------------
+# RSS PARSER
+# -------------------------
+def parse_rss(text, source):
     feed = feedparser.parse(text)
-    return feed if feed.entries else None
 
-# -----------------------------
-# WORDPRESS API (🔥 KEY)
-# -----------------------------
-def try_wordpress_api(base_url):
-    api = base_url.rstrip("/") + "/wp-json/wp/v2/posts?per_page=20"
+    results = []
 
-    try:
-        r = requests.get(api, headers=HEADERS, timeout=10)
-        if r.status_code != 200:
-            return []
-
-        data = r.json()
-        results = []
-
-        for post in data:
-            link = post.get("link")
-            title = post.get("title", {}).get("rendered", "")
-
-            if link:
-                results.append({
-                    "title": BeautifulSoup(title, "html.parser").get_text(),
-                    "link": link,
-                    "summary": "",
-                    "source": base_url
-                })
-
-        if results:
-            print("🧠 WordPress API used")
-
-        return results
-
-    except:
-        return []
-
-# -----------------------------
-# SITEMAP (ADVANCED)
-# -----------------------------
-def try_sitemap(base_url):
-    root = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
-
-    sitemap_paths = [
-        "/sitemap.xml",
-        "/sitemap_index.xml",
-        "/wp-sitemap.xml",
-        "/post-sitemap.xml"
-    ]
-
-    links = []
-
-    for path in sitemap_paths:
-        xml = fetch(root + path)
-        if not xml:
+    for entry in feed.entries:
+        link = entry.get("link")
+        if not link or link in seen_articles:
             continue
 
-        soup = BeautifulSoup(xml, "xml")
+        seen_articles.add(link)
 
-        # nested sitemap
-        if soup.find_all("sitemap"):
-            for loc in soup.find_all("loc"):
-                sub = fetch(loc.text)
-                if not sub:
-                    continue
+        results.append({
+            "title": entry.get("title", ""),
+            "link": link,
+            "summary": entry.get("summary", ""),
+            "source": source
+        })
 
-                sub_soup = BeautifulSoup(sub, "xml")
-                for u in sub_soup.find_all("loc"):
-                    links.append(u.text)
+    return results
 
-        else:
-            for loc in soup.find_all("loc"):
-                links.append(loc.text)
 
-    if links:
-        print("🧠 Sitemap used")
+# -------------------------
+# SITEMAP PARSER
+# -------------------------
+def parse_sitemap(text):
+    soup = BeautifulSoup(text, "xml")
+    return [loc.text for loc in soup.find_all("loc")][:20]
 
-    return links[:30]
 
-# -----------------------------
-# ARTICLE FILTER
-# -----------------------------
-def is_article_url(url):
-    u = url.lower()
-
-    bad = ["category", "tag", "page", "author", "login", "contact"]
-    if any(b in u for b in bad):
-        return False
-
-    if any(x in u for x in ["202", "/news/", "/article/", "/post/"]):
-        return True
-
-    return len(u.split("/")) > 5
-
-# -----------------------------
-# HTML CRAWL
-# -----------------------------
-def crawl_html(base_url):
-    html = fetch(base_url)
-    if not html:
-        return []
-
+# -------------------------
+# HTML LINK EXTRACTOR
+# -------------------------
+def extract_links(base_url, html):
     soup = BeautifulSoup(html, "html.parser")
     links = set()
 
     for a in soup.find_all("a", href=True):
-        link = urljoin(base_url, a["href"])
+        full = urljoin(base_url, a["href"])
 
-        if urlparse(link).netloc != urlparse(base_url).netloc:
+        if urlparse(full).netloc != urlparse(base_url).netloc:
             continue
 
-        if is_article_url(link):
-            links.add(link)
+        if any(x in full.lower() for x in [
+            "category", "tag", "login", "about", "contact", "#"
+        ]):
+            continue
 
-    return list(links)[:20]
+        if len(full.split("/")) < 4:
+            continue
 
-# -----------------------------
-# JS CRAWL (LAST RESORT)
-# -----------------------------
-def crawl_js(url):
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-            page = browser.new_page()
+        links.add(full)
 
-            page.goto(url, timeout=20000, wait_until="domcontentloaded")
-            page.wait_for_timeout(1500)
+    return list(links)
 
-            html = page.content()
-            browser.close()
 
-            soup = BeautifulSoup(html, "html.parser")
-            links = set()
-
-            for a in soup.find_all("a", href=True):
-                link = urljoin(url, a["href"])
-
-                if urlparse(link).netloc != urlparse(url).netloc:
-                    continue
-
-                if is_article_url(link):
-                    links.add(link)
-
-            return list(links)[:20]
-
-    except PlaywrightTimeoutError:
-        print("⏱️ Playwright timeout")
-        return []
-    except Exception as e:
-        print(f"❌ Playwright error: {e}")
-        return []
-
-# -----------------------------
-# ARTICLE EXTRACTION
-# -----------------------------
+# -------------------------
+# ARTICLE EXTRACTOR
+# -------------------------
 def extract_article(url):
-    try:
-        downloaded = trafilatura.fetch_url(url)
-        if not downloaded:
-            return ""
-        text = trafilatura.extract(downloaded)
-        return text.strip() if text else ""
-    except:
+    downloaded = trafilatura.fetch_url(url)
+
+    if not downloaded:
         return ""
 
-# -----------------------------
-# SMART ROUTER
-# -----------------------------
-def resolve(url):
+    text = trafilatura.extract(downloaded)
+
+    return text or ""
+
+
+# -------------------------
+# MAIN ROUTER
+# -------------------------
+def process_url(url):
     print(f"\n🔎 Processing: {url}")
 
-    # 1. RSS
-    feed = parse_rss(url)
-    if feed:
+    html = fetch(url)
+
+    # try cache if blocked
+    if not html:
+        html = fetch_google_cache(url)
+
+    if not html:
+        print("❌ Failed completely")
+        return []
+
+    page_type = detect_type(html)
+
+    if page_type == "rss":
         print("✅ RSS detected")
-        return ("rss", feed, url)
+        return parse_rss(html, url)
 
-    # 2. WordPress API
-    wp = try_wordpress_api(url)
-    if wp:
-        return ("wp", wp, url)
+    elif page_type == "sitemap":
+        print("🧭 Sitemap detected")
+        links = parse_sitemap(html)
 
-    # 3. Sitemap
-    sm = try_sitemap(url)
-    if sm:
-        return ("links", sm, url)
+        results = []
+        for link in links:
+            content = extract_article(link)
+            if content:
+                results.append({
+                    "title": link.split("/")[-1],
+                    "link": link,
+                    "summary": content[:500],
+                    "source": url
+                })
+        return results
 
-    # 4. HTML
-    html_links = crawl_html(url)
-    if html_links:
-        print("🧠 HTML crawl")
-        return ("links", html_links, url)
+    elif page_type == "html":
+        print("🧠 HTML fallback")
 
-    # 5. JS
-    print("🧠 JS fallback")
-    js_links = crawl_js(url)
-    return ("links", js_links, url)
+        links = extract_links(url, html)
 
-# -----------------------------
-# MAIN PIPELINE
-# -----------------------------
-def run(urls):
+        results = []
+        for link in links[:15]:
+            if link in seen_articles:
+                continue
+
+            seen_articles.add(link)
+
+            content = extract_article(link)
+
+            if not content or len(content) < 200:
+                continue
+
+            results.append({
+                "title": link.split("/")[-1],
+                "link": link,
+                "summary": content[:500],
+                "source": url
+            })
+
+        return results
+
+    else:
+        print("❓ Unknown format")
+        return []
+
+
+# -------------------------
+# RUN PIPELINE
+# -------------------------
+def main():
+    with open("rss_feeds.txt") as f:
+        urls = [u.strip() for u in f if u.strip()]
+
     all_news = []
 
     for url in urls:
-        mode, data, base = resolve(url)
-
-        if mode == "rss":
-            for e in data.entries:
-                link = normalize_url(e.get("link", ""))
-
-                if link in seen_articles:
-                    continue
-                seen_articles.add(link)
-
-                all_news.append({
-                    "title": e.get("title", ""),
-                    "link": link,
-                    "summary": e.get("summary", "")[:500],
-                    "source": base
-                })
-
-        elif mode == "wp":
-            all_news.extend(data)
-
-        else:
-            for link in data:
-                link = normalize_url(link)
-
-                if link in seen_articles:
-                    continue
-                seen_articles.add(link)
-
-                text = extract_article(link)
-                if not text or len(text) < 200:
-                    continue
-
-                all_news.append({
-                    "title": link.split("/")[-1],
-                    "link": link,
-                    "summary": text[:800],
-                    "source": base
-                })
+        articles = process_url(url)
+        all_news.extend(articles)
 
     print(f"\n✅ Collected: {len(all_news)}")
 
     with open("news.json", "w", encoding="utf-8") as f:
-        json.dump(all_news, f, ensure_ascii=False, indent=2)
+        json.dump({
+            "updated": datetime.now(timezone.utc).isoformat(),
+            "news": all_news
+        }, f, indent=2, ensure_ascii=False)
 
-# -----------------------------
-# RUN
-# -----------------------------
+
 if __name__ == "__main__":
-    with open("rss_feeds.txt") as f:
-        urls = [x.strip() for x in f if x.strip()]
-
-    run(urls)
+    main()
