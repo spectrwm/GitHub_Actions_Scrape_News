@@ -1,4 +1,4 @@
-https://astraparis.gr/rss
+https://astraparis.gr
 https://lerosnews.gr/rss
 http://naftemporiki.gr/rss
 https://www.dimokratiki.gr/feed/
@@ -7,14 +7,14 @@ https://www.ethnos.gr/rss
 https://www.real.gr/feed/
 https://www.naftemporiki.gr/feed/
 https://www.eleftheria.gr/feed/
-https://www.rodiaki.gr/feed
+https://www.rodiaki.gr
 https://evrytanika.gr/feed/
 https://www.neakriti.gr/rss.xml
 https://www.pentapostagma.gr/rss.xml
 https://www.koutipandoras.gr/feed/
-https://www.efsyn.gr/rss.xml
+https://www.efsyn.gr
 https://pelop.gr/feed/
 https://www.alexpolisonline.com/rss.xml
 https://www.evros-news.gr/feed/
-https://corfutvnews.gr/feed/
+https://corfutvnews.gr
 https://www.news.gr/rss.ashx
