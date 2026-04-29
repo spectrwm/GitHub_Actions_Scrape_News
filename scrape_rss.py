@@ -1,98 +1,120 @@
+import json
+import time
+import random
 import requests
 import feedparser
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, parse_qs
 from datetime import datetime, timezone
-import json, time, random
 
 from playwright.sync_api import sync_playwright
 
+
 # =========================
-# GLOBAL CONFIG
+# HEADERS (stable, safe)
 # =========================
 HEADERS = {
-    "User-Agent": random.choice([
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/119",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_0) AppleWebKit/537.36 Safari/537.36"
-    ]),
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
     "Accept": "text/html,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9"
 }
 
-MAX_RETRIES = 3
-PLAYWRIGHT_POOL_SIZE = 2
+
+# =========================
+# BLOCK RULES (FIX YOUR ISSUE)
+# =========================
+BLOCK_PATTERNS = [
+    "search",
+    "cache:",
+    "httpservice",
+    "enablejs",
+    "retry",
+    "login",
+    "signup",
+    "wp-login"
+]
+
+TRACKING_PARAMS = {
+    "sca_esv",
+    "emsg",
+    "sei",
+    "utm_source",
+    "utm_medium",
+    "utm_campaign"
+}
 
 
 # =========================
-# FETCH WITH BACKOFF
+# URL VALIDATION (IMPORTANT FIX)
+# =========================
+def is_valid_url(url):
+    if not url:
+        return False
+
+    u = url.lower()
+
+    # block junk paths
+    if any(p in u for p in BLOCK_PATTERNS):
+        return False
+
+    parsed = urlparse(url)
+
+    # remove tracking params
+    qs = parse_qs(parsed.query)
+    if any(k in TRACKING_PARAMS for k in qs.keys()):
+        return False
+
+    # must have meaningful path
+    if len(parsed.path) < 2:
+        return False
+
+    return True
+
+
+# =========================
+# SAFE FETCH
 # =========================
 def fetch(url):
-    for attempt in range(MAX_RETRIES):
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=10)
-            if r.status_code == 200:
-                return r.text
-        except:
-            pass
-
-        sleep = 2 ** attempt + random.random()
-        time.sleep(sleep)
-
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        if r.status_code == 200:
+            return r.text
+    except:
+        pass
     return None
 
 
 # =========================
-# GOOGLE CACHE FALLBACK
+# GOOGLE CACHE (optional fallback)
 # =========================
-def fetch_google_cache(url):
+def google_cache(url):
     cache_url = f"https://webcache.googleusercontent.com/search?q=cache:{url}"
-    print(f"🌐 Google cache fallback: {url}")
     return fetch(cache_url)
 
 
 # =========================
-# CONTENT TYPE DETECTION
+# TYPE DETECTION
 # =========================
-def detect_type(text):
-    if not text:
-        return "none"
-
-    t = text.lower()
-
-    if "<rss" in t or "<feed" in t:
-        return "rss"
-
-    if "<urlset" in t:
-        return "sitemap"
-
-    if "<html" in t:
-        return "html"
-
-    return "unknown"
-
-
-# =========================
-# CMS DETECTION
-# =========================
-def detect_cms(url, html):
+def detect_type(html):
     if not html:
         return None
 
-    if "wp-content" in html or "wp-json" in html:
-        return "wordpress"
+    h = html.lower()
 
-    if "ghost" in html:
-        return "ghost"
+    if "<rss" in h or "<feed" in h:
+        return "rss"
 
-    if "drupal" in html:
-        return "drupal"
+    if "<urlset" in h:
+        return "sitemap"
+
+    if "<html" in h:
+        return "html"
 
     return None
 
 
 # =========================
-# WORDPRESS API (🔥 BEST)
+# WORDPRESS API (BEST PATH)
 # =========================
 def wordpress_api(url):
     base = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
@@ -107,117 +129,90 @@ def wordpress_api(url):
     except:
         return []
 
-    results = []
-
+    out = []
     for p in posts:
-        results.append({
+        out.append({
             "title": BeautifulSoup(p["title"]["rendered"], "html.parser").get_text(),
             "link": p["link"],
-            "published": p["date"],
+            "published": p.get("date"),
             "summary": BeautifulSoup(p["excerpt"]["rendered"], "html.parser").get_text(),
             "source": base
         })
 
-    print("🚀 WordPress API success")
-    return results
+    return out
 
 
 # =========================
 # RSS PARSER
 # =========================
-def parse_rss(url, text):
-    feed = feedparser.parse(text)
+def parse_rss(url, html):
+    feed = feedparser.parse(html)
 
-    results = []
-
-    for e in feed.entries:
-        results.append({
-            "title": e.get("title", ""),
-            "link": e.get("link", ""),
-            "published": e.get("published", ""),
-            "summary": BeautifulSoup(
-                e.get("summary", ""), "html.parser"
-            ).get_text(),
-            "source": url
-        })
-
-    return results
+    return [{
+        "title": e.get("title", ""),
+        "link": e.get("link", ""),
+        "published": e.get("published", ""),
+        "summary": BeautifulSoup(e.get("summary", ""), "html.parser").get_text(),
+        "source": url
+    } for e in feed.entries]
 
 
 # =========================
 # SITEMAP PARSER
 # =========================
-def parse_sitemap(base_url, text):
-    soup = BeautifulSoup(text, "xml")
+def parse_sitemap(url, html):
+    soup = BeautifulSoup(html, "xml")
+    links = [l.text for l in soup.find_all("loc")]
 
-    links = [loc.text for loc in soup.find_all("loc")]
-
-    return [{"link": l, "title": l.split("/")[-1], "source": base_url} for l in links[:10]]
+    return [{
+        "title": l.split("/")[-1],
+        "link": l,
+        "source": url
+    } for l in links if is_valid_url(l)][:15]
 
 
 # =========================
-# HTML PARSER
+# HTML PARSER (FIXED)
 # =========================
-def parse_html(base_url, html):
+def parse_html(url, html):
     soup = BeautifulSoup(html, "html.parser")
 
     links = set()
 
     for a in soup.find_all("a", href=True):
-        full = urljoin(base_url, a["href"])
+        full = urljoin(url, a["href"])
 
-        if urlparse(full).netloc != urlparse(base_url).netloc:
+        if not is_valid_url(full):
             continue
 
-        if len(full.split("/")) < 4:
+        if urlparse(full).netloc != urlparse(url).netloc:
             continue
 
         links.add(full)
 
-    results = []
-
-    for l in list(links)[:10]:
-        results.append({
-            "title": l.split("/")[-1],
-            "link": l,
-            "summary": "",
-            "source": base_url
-        })
-
-    return results
+    return [{
+        "title": l.split("/")[-1],
+        "link": l,
+        "source": url
+    } for l in list(links)[:15]]
 
 
 # =========================
-# PLAYWRIGHT POOL (🔥 FAST)
+# PLAYWRIGHT FALLBACK
 # =========================
-class BrowserPool:
-    def __init__(self, size=2):
-        self.p = sync_playwright().start()
-        self.browsers = [
-            self.p.chromium.launch(headless=True, args=["--no-sandbox"])
-            for _ in range(size)
-        ]
-        self.idx = 0
-
-    def get_page(self):
-        browser = self.browsers[self.idx]
-        self.idx = (self.idx + 1) % len(self.browsers)
-        return browser.new_page()
-
-    def close(self):
-        for b in self.browsers:
-            b.close()
-        self.p.stop()
-
-
-def playwright_fetch(pool, url):
+def fetch_rendered(url):
     try:
-        page = pool.get_page()
-        page.goto(url, timeout=20000)
-        page.wait_for_timeout(2000)
-        html = page.content()
-        page.close()
-        return html
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+
+            page.goto(url, timeout=30000)
+            page.wait_for_timeout(2000)
+
+            html = page.content()
+
+            browser.close()
+            return html
     except:
         return None
 
@@ -225,47 +220,41 @@ def playwright_fetch(pool, url):
 # =========================
 # SMART ROUTER
 # =========================
-def process_url(url, pool):
+def process(url):
     print(f"\n🔎 Processing: {url}")
 
     html = fetch(url)
 
     if not html:
-        html = fetch_google_cache(url)
+        html = google_cache(url)
 
-    typ = detect_type(html)
+    t = detect_type(html)
 
-    # ---- RSS
-    if typ == "rss":
+    # RSS
+    if t == "rss":
         print("✅ RSS detected")
         return parse_rss(url, html)
 
-    # ---- CMS detection
-    cms = detect_cms(url, html)
+    # WordPress API
+    wp = wordpress_api(url)
+    if wp:
+        print("🚀 WP API")
+        return wp
 
-    if cms == "wordpress":
-        data = wordpress_api(url)
-        if data:
-            return data
+    # Sitemap
+    sitemap = fetch(url.rstrip("/") + "/sitemap.xml")
+    if sitemap and detect_type(sitemap) == "sitemap":
+        print("🧠 Sitemap")
+        return parse_sitemap(url, sitemap)
 
-    # ---- Sitemap fallback
-    sitemap = url.rstrip("/") + "/sitemap.xml"
-    sm = fetch(sitemap)
+    # HTML
+    if html:
+        print("🧠 HTML")
+        return parse_html(url, html)
 
-    if sm and detect_type(sm) == "sitemap":
-        print("🧠 Sitemap used")
-        return parse_sitemap(url, sm)
-
-    # ---- HTML parse
-    if html and typ == "html":
-        print("🧠 HTML parse")
-        data = parse_html(url, html)
-        if data:
-            return data
-
-    # ---- PLAYWRIGHT LAST
+    # Playwright fallback
     print("🧠 Playwright fallback")
-    html = playwright_fetch(pool, url)
+    html = fetch_rendered(url)
 
     if html:
         return parse_html(url, html)
@@ -280,22 +269,18 @@ def main():
     with open("rss_feeds.txt") as f:
         urls = [u.strip() for u in f if u.strip()]
 
-    pool = BrowserPool(PLAYWRIGHT_POOL_SIZE)
-
-    all_news = []
+    all_data = []
 
     for url in urls:
-        data = process_url(url, pool)
-        all_news.extend(data)
+        data = process(url)
+        all_data.extend(data)
 
-    pool.close()
-
-    print(f"\n✅ Collected: {len(all_news)}")
+    print(f"\n✅ Collected: {len(all_data)}")
 
     with open("news.json", "w", encoding="utf-8") as f:
         json.dump({
-            "last_updated": datetime.now(timezone.utc).isoformat(),
-            "news": all_news
+            "updated": datetime.now(timezone.utc).isoformat(),
+            "data": all_data
         }, f, indent=2, ensure_ascii=False)
 
 
