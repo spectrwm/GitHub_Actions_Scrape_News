@@ -18,3 +18,4 @@ https://www.alexpolisonline.com/rss.xml
 https://www.evros-news.gr/feed/
 https://corfutvnews.gr
 https://www.news.gr/rss.ashx
+https://news.google.com/rss/search?q=%CE%9B%CE%A3&hl=el&gl=GR&ceid=GR:el
