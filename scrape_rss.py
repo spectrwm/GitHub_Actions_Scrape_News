@@ -7,7 +7,12 @@ from email.utils import parsedate_to_datetime
 import trafilatura
 from urllib.parse import urlparse, urljoin, urlunparse, parse_qsl, urlencode
 
+from playwright.sync_api import sync_playwright
 
+
+# -----------------------------
+# CONFIG
+# -----------------------------
 COMMON_RSS_PATHS = [
     "/rss",
     "/feed",
@@ -22,22 +27,75 @@ seen_articles = set()
 
 
 # -----------------------------
-# URL normalization (remove tracking params)
+# PLAYWRIGHT (persistent browser)
 # -----------------------------
-def normalize_url(url):
+_playwright = sync_playwright().start()
+_browser = _playwright.chromium.launch(
+    headless=True,
+    args=["--no-sandbox", "--disable-dev-shm-usage"]
+)
+
+
+def fetch_rendered(url, wait_ms=1500):
     try:
-        parsed = urlparse(url)
-        clean_query = [
-            (k, v) for k, v in parse_qsl(parsed.query)
-            if not k.startswith("utm")
-        ]
-        return urlunparse(parsed._replace(query=urlencode(clean_query)))
-    except Exception:
-        return url
+        page = _browser.new_page()
+        page.goto(url, timeout=30000)
+        page.wait_for_timeout(wait_ms)
+
+        html = page.content()
+        page.close()
+
+        return html
+
+    except Exception as e:
+        print(f"❌ Playwright failed: {url} → {e}")
+        return None
+
+
+def extract_article_playwright(url):
+    html = fetch_rendered(url)
+
+    if not html:
+        return ""
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+        tag.decompose()
+
+    paragraphs = soup.find_all("p")
+    return "\n".join(p.get_text(" ", strip=True) for p in paragraphs).strip()
+
+
+def extract_links_from_js_site(base_url, limit=15):
+    html = fetch_rendered(base_url)
+
+    if not html:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    links = set()
+
+    for a in soup.find_all("a", href=True):
+        full = urljoin(base_url, a["href"])
+
+        if urlparse(full).netloc != urlparse(base_url).netloc:
+            continue
+
+        if any(x in full.lower() for x in [
+            "login", "signup", "tag", "category",
+            "privacy", "about", "contact", "#"
+        ]):
+            continue
+
+        links.add(full)
+
+    return list(links)[:limit]
 
 
 # -----------------------------
-# HTTP fetch
+# HTTP FETCH
 # -----------------------------
 def fetch(url):
     try:
@@ -57,7 +115,22 @@ def fetch(url):
 
 
 # -----------------------------
-# RSS validation
+# NORMALIZE URL
+# -----------------------------
+def normalize_url(url):
+    try:
+        parsed = urlparse(url)
+        clean_query = [
+            (k, v) for k, v in parse_qsl(parsed.query)
+            if not k.startswith("utm")
+        ]
+        return urlunparse(parsed._replace(query=urlencode(clean_query)))
+    except Exception:
+        return url
+
+
+# -----------------------------
+# RSS CHECK
 # -----------------------------
 def is_valid_feed(feed):
     return feed and hasattr(feed, "entries") and len(feed.entries) > 0
@@ -67,9 +140,6 @@ def looks_like_html(text):
     return text and ("<html" in text.lower() or "<!doctype html" in text.lower())
 
 
-# -----------------------------
-# Try RSS URL
-# -----------------------------
 def try_feed(url):
     text = fetch(url)
     if not text or looks_like_html(text):
@@ -80,7 +150,7 @@ def try_feed(url):
 
 
 # -----------------------------
-# RSS discovery from homepage
+# RSS DISCOVERY
 # -----------------------------
 def discover_rss(url):
     html = fetch(url)
@@ -99,26 +169,17 @@ def discover_rss(url):
     return list(feeds)
 
 
-# -----------------------------
-# fallback RSS candidates
-# -----------------------------
 def generate_candidates(url):
     parsed = urlparse(url)
     root = f"{parsed.scheme}://{parsed.netloc}"
+    return [root + p for p in COMMON_RSS_PATHS]
 
-    return [root + path for path in COMMON_RSS_PATHS]
 
-
-# -----------------------------
-# resolve feed
-# -----------------------------
 def resolve_feed(url):
-    # direct
     feed = try_feed(url)
     if feed:
         return url, feed
 
-    # common paths
     for c in generate_candidates(url):
         if c in seen_feeds:
             continue
@@ -128,7 +189,6 @@ def resolve_feed(url):
         if feed:
             return c, feed
 
-    # homepage discovery
     for c in discover_rss(url):
         if c in seen_feeds:
             continue
@@ -142,7 +202,7 @@ def resolve_feed(url):
 
 
 # -----------------------------
-# safe date parsing
+# DATE PARSING
 # -----------------------------
 def parse_date(entry):
     for key in ["published_parsed", "updated_parsed"]:
@@ -165,7 +225,7 @@ def parse_date(entry):
 
 
 # -----------------------------
-# article summary / extraction
+# ARTICLE EXTRACTION
 # -----------------------------
 def get_summary(entry, link=None):
     text = (
@@ -191,26 +251,23 @@ def get_summary(entry, link=None):
 
 
 # -----------------------------
-# fallback crawler (no RSS sites)
+# STATIC CRAWLER
 # -----------------------------
 def crawl_site(url, limit=15):
     base = url.rstrip("/")
 
-    # 🔥 multiple likely article hubs
-    start_pages = [
+    pages = [
         base,
         base + "/news",
         base + "/latest",
         base + "/category/news",
         base + "/articles",
-        base + "/post",
-        base + "/2026",
-        base + "/2025"
+        base + "/post"
     ]
 
     links = set()
 
-    for page in start_pages:
+    for page in pages:
         html = fetch(page)
         if not html:
             continue
@@ -223,38 +280,26 @@ def crawl_site(url, limit=15):
             if urlparse(full).netloc != urlparse(base).netloc:
                 continue
 
-            # filter noise
             if any(x in full.lower() for x in [
                 "login", "signup", "tag", "category",
                 "privacy", "about", "contact", "#"
             ]):
                 continue
 
-            # keep likely articles
-            if len(full.split("/")) < 4:
-                continue
-
             links.add(full)
-
-    # rank (important!)
-    links = sorted(list(links), key=lambda x: (
-        ("2026" in x or "2025" in x),
-        ("news" in x),
-        -len(x.split("/"))
-    ), reverse=True)
 
     results = []
 
-    for link in links[:limit]:
+    for link in list(links)[:limit]:
         link = normalize_url(link)
 
         if link in seen_articles:
             continue
         seen_articles.add(link)
 
-        content = extract_full_article(link)
+        content = get_summary({"summary": ""}, link)
 
-        if not content or len(content) < 200:
+        if not content:
             continue
 
         results.append({
@@ -284,7 +329,34 @@ for url in urls:
 
     if not feed:
         print(f"🧠 No RSS → crawling: {url}")
-        all_news.extend(crawl_site(url))
+        articles = crawl_site(url)
+
+        if not articles:
+            print(f"🧠 Playwright fallback: {url}")
+
+            links = extract_links_from_js_site(url)
+
+            for link in links:
+                if link in seen_articles:
+                    continue
+                seen_articles.add(link)
+
+                content = extract_article_playwright(link)
+
+                if not content or len(content) < 200:
+                    continue
+
+                all_news.append({
+                    "title": link.split("/")[-1],
+                    "link": link,
+                    "published": None,
+                    "source": url,
+                    "summary": content[:800]
+                })
+
+            continue
+
+        all_news.extend(articles)
         continue
 
     for entry in feed.entries:
@@ -309,7 +381,7 @@ for url in urls:
 
 
 # -----------------------------
-# SAVE OUTPUT
+# OUTPUT
 # -----------------------------
 print(f"✅ Collected {len(all_news)} articles")
 
@@ -319,3 +391,10 @@ with open("news.json", "w", encoding="utf-8") as f:
         "last_updated": datetime.now(timezone.utc).isoformat(),
         "news": all_news
     }, f, indent=2, ensure_ascii=False)
+
+
+# -----------------------------
+# CLEANUP PLAYWRIGHT
+# -----------------------------
+_browser.close()
+_playwright.stop()
