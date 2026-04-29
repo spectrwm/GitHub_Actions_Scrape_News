@@ -21,7 +21,7 @@ for url in urls:
         if 'published_parsed' in entry and entry.published_parsed:
             published_dt = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
 
-            if published_dt > cutoff_time:
+            if published_dt: #> cutoff_time:
                 summary = ""
 
                 if "summary" in entry:
