@@ -39,8 +39,7 @@ _browser = _playwright.chromium.launch(
 def fetch_rendered(url, wait_ms=1500):
     try:
         page = _browser.new_page()
-        page.goto(url, timeout=30000)
-        page.wait_for_timeout(wait_ms)
+        page.goto(url, wait_until="networkidle", timeout=30000)
 
         html = page.content()
         page.close()
