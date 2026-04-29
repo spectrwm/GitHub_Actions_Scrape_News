@@ -1,37 +1,51 @@
-name: Scrape RSS Feeds
+name: Scrape News (Anti-Bot Hybrid)
 
 on:
   schedule:
-    - cron: '0 12 * * *'
+    - cron: '0 12 * * *'   # daily run
   workflow_dispatch:
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
+      # -----------------------------
+      # Checkout repo
+      # -----------------------------
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # -----------------------------
+      # Python setup
+      # -----------------------------
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
+      # -----------------------------
+      # Install dependencies
+      # (includes Playwright + tools)
+      # -----------------------------
       - name: Install dependencies
         run: |
-          pip install feedparser requests beautifulsoup4 trafilatura[lxml] playwright
+          pip install feedparser requests beautifulsoup4 trafilatura[lxml] httpx fake-useragent playwright
           playwright install --with-deps
 
+      # -----------------------------
+      # Run scraper
+      # -----------------------------
       - name: Run scraper
         run: python scrape_rss.py
 
-      - name: Commit and push changes
+      # -----------------------------
+      # Commit results
+      # -----------------------------
+      - name: Commit and push results
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
           git add news.json
-          git commit -m "Update news.json [bot]" || echo "No changes to commit"
+          git commit -m "Update news.json [bot]" || echo "No changes"
           git push
