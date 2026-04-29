@@ -193,45 +193,76 @@ def get_summary(entry, link=None):
 # -----------------------------
 # fallback crawler (no RSS sites)
 # -----------------------------
-def crawl_site(url, limit=10):
-    html = fetch(url)
-    if not html:
-        return []
+def crawl_site(url, limit=15):
+    base = url.rstrip("/")
 
-    soup = BeautifulSoup(html, "html.parser")
+    # 🔥 multiple likely article hubs
+    start_pages = [
+        base,
+        base + "/news",
+        base + "/latest",
+        base + "/category/news",
+        base + "/articles",
+        base + "/post",
+        base + "/2026",
+        base + "/2025"
+    ]
 
     links = set()
-    for a in soup.find_all("a", href=True):
-        full = urljoin(url, a["href"])
 
-        if urlparse(full).netloc != urlparse(url).netloc:
+    for page in start_pages:
+        html = fetch(page)
+        if not html:
             continue
 
-        if any(x in full.lower() for x in ["login", "tag", "category", "privacy", "about", "#"]):
-            continue
+        soup = BeautifulSoup(html, "html.parser")
 
-        links.add(full)
+        for a in soup.find_all("a", href=True):
+            full = urljoin(page, a["href"])
+
+            if urlparse(full).netloc != urlparse(base).netloc:
+                continue
+
+            # filter noise
+            if any(x in full.lower() for x in [
+                "login", "signup", "tag", "category",
+                "privacy", "about", "contact", "#", "author"
+            ]:
+                continue
+
+            # keep likely articles
+            if len(full.split("/")) < 4:
+                continue
+
+            links.add(full)
+
+    # rank (important!)
+    links = sorted(list(links), key=lambda x: (
+        ("2026" in x or "2025" in x),
+        ("news" in x),
+        -len(x.split("/"))
+    ), reverse=True)
 
     results = []
 
-    for link in list(links)[:limit]:
+    for link in links[:limit]:
         link = normalize_url(link)
 
         if link in seen_articles:
             continue
         seen_articles.add(link)
 
-        content = get_summary({"summary": ""}, link)
+        content = extract_full_article(link)
 
-        if not content:
+        if not content or len(content) < 200:
             continue
 
         results.append({
             "title": link.split("/")[-1],
             "link": link,
             "published": None,
-            "source": url,
-            "summary": content[:500]
+            "source": base,
+            "summary": content[:800]
         })
 
     return results
