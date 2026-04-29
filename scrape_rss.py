@@ -1,237 +1,206 @@
 import feedparser
-import httpx
+import requests
 import json
-import trafilatura
-from bs4 import BeautifulSoup
+import time
+import re
 from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse, urljoin, urlunparse, parse_qsl, urlencode
-from fake_useragent import UserAgent
+from bs4 import BeautifulSoup
+from email.utils import parsedate_to_datetime
+
+# -----------------------------
+# OPTIONAL: PLAYWRIGHT
+# -----------------------------
 from playwright.sync_api import sync_playwright
 
 # -----------------------------
-# CONFIG
+# GLOBAL STATE
 # -----------------------------
-COMMON_RSS_PATHS = [
-    "/rss",
-    "/feed",
-    "/rss.xml",
-    "/feed.xml",
-    "/?feed=rss2",
-    "/?format=rss"
-]
-
 seen_feeds = set()
 seen_articles = set()
-ua = UserAgent()
 
 # -----------------------------
-# URL normalization
+# URL NORMALIZATION
 # -----------------------------
 def normalize_url(url):
     try:
         parsed = urlparse(url)
-        clean_query = [(k, v) for k, v in parse_qsl(parsed.query) if not k.startswith("utm")]
+        clean_query = [(k, v) for k, v in parse_qsl(parsed.query)
+                       if not k.startswith("utm")]
         return urlunparse(parsed._replace(query=urlencode(clean_query)))
-    except Exception:
+    except:
         return url
 
 # -----------------------------
-# FAST HTTP FETCH
+# FETCH (STATIC)
 # -----------------------------
-def fetch_http(url):
+def fetch(url):
     try:
-        headers = {
-            "User-Agent": ua.random,
-            "Accept": "text/html,application/xhtml+xml",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.google.com/"
-        }
-
-        with httpx.Client(timeout=10, follow_redirects=True, headers=headers) as client:
-            r = client.get(url)
-            if r.status_code == 200 and len(r.text) > 500:
-                return r.text
-    except Exception:
-        pass
-    return None
-
-# -----------------------------
-# PLAYWRIGHT FALLBACK (STEALTH)
-# -----------------------------
-def fetch_playwright(url):
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-blink-features=AutomationControlled"]
-            )
-
-            context = browser.new_context(
-                user_agent=ua.random,
-                viewport={"width": 1280, "height": 800}
-            )
-
-            page = context.new_page()
-            page.goto(url, wait_until="networkidle", timeout=30000)
-            page.wait_for_timeout(1500)
-
-            html = page.content()
-            browser.close()
-            return html
-
-    except Exception:
+        r = requests.get(
+            url,
+            timeout=15,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        if r.status_code != 200:
+            return None
+        return r.text
+    except:
         return None
 
 # -----------------------------
-# UNIFIED FETCHER (ANTI-BOT LAYER)
+# PLAYWRIGHT FETCH
 # -----------------------------
-def fetch(url):
-    html = fetch_http(url)
-    if html:
-        return html
-
-    return fetch_playwright(url)
+def fetch_rendered(url, wait=2000):
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, timeout=30000)
+            page.wait_for_timeout(wait)
+            html = page.content()
+            browser.close()
+            return html
+    except:
+        return None
 
 # -----------------------------
-# RSS VALIDATION
+# RSS CHECK
 # -----------------------------
 def is_valid_feed(feed):
     return feed and hasattr(feed, "entries") and len(feed.entries) > 0
 
 def try_feed(url):
-    html = fetch(url)
-    if not html or "<html" in html.lower():
+    text = fetch(url)
+    if not text:
         return None
-
-    feed = feedparser.parse(html)
+    feed = feedparser.parse(text)
     return feed if is_valid_feed(feed) else None
 
 # -----------------------------
-# RSS DISCOVERY
+# SITEMAP SCRAPER (IMPORTANT FIX)
 # -----------------------------
-def discover_rss(url):
-    html = fetch(url)
+def try_sitemap(base_url):
+    candidates = [
+        base_url.rstrip("/") + "/sitemap.xml",
+        base_url.rstrip("/") + "/sitemap_index.xml"
+    ]
+
+    for url in candidates:
+        xml = fetch(url)
+        if not xml:
+            continue
+
+        soup = BeautifulSoup(xml, "xml")
+        links = [loc.text.strip() for loc in soup.find_all("loc")]
+
+        # filter likely articles
+        articles = [
+            l for l in links
+            if any(x in l.lower() for x in ["news", "article", "post", "202", "blog"])
+        ]
+
+        if articles:
+            return articles[:20]
+
+    return []
+
+# -----------------------------
+# HOMEPAGE LINK SCRAPER
+# -----------------------------
+def extract_links_static(base_url, html):
+    soup = BeautifulSoup(html, "html.parser")
+    links = set()
+
+    for a in soup.find_all("a", href=True):
+        full = urljoin(base_url, a["href"])
+
+        if urlparse(full).netloc != urlparse(base_url).netloc:
+            continue
+
+        if any(x in full.lower() for x in [
+            "login", "signup", "tag", "category",
+            "privacy", "about", "contact", "#"
+        ]):
+            continue
+
+        links.add(full)
+
+    return list(links)
+
+# -----------------------------
+# PLAYWRIGHT ARTICLE EXTRACTION
+# -----------------------------
+def extract_links_js(base_url):
+    html = fetch_rendered(base_url)
     if not html:
         return []
 
     soup = BeautifulSoup(html, "html.parser")
-    feeds = set()
 
-    for link in soup.find_all("link"):
-        if link.get("type") in ["application/rss+xml", "application/atom+xml"]:
-            href = link.get("href")
-            if href:
-                feeds.add(urljoin(url, href))
+    selectors = [
+        "article a",
+        "h2 a",
+        "h3 a",
+        ".post a",
+        ".entry a"
+    ]
 
-    return list(feeds)
+    links = set()
 
-def generate_candidates(url):
-    parsed = urlparse(url)
-    root = f"{parsed.scheme}://{parsed.netloc}"
-    return [root + p for p in COMMON_RSS_PATHS]
+    for sel in selectors:
+        for a in soup.select(sel):
+            href = a.get("href")
+            if not href:
+                continue
 
-def resolve_feed(url):
-    feed = try_feed(url)
-    if feed:
-        return url, feed
+            full = urljoin(base_url, href)
 
-    for c in generate_candidates(url):
-        if c in seen_feeds:
-            continue
-        seen_feeds.add(c)
+            if urlparse(full).netloc == urlparse(base_url).netloc:
+                links.add(full)
 
-        feed = try_feed(c)
-        if feed:
-            return c, feed
-
-    for c in discover_rss(url):
-        if c in seen_feeds:
-            continue
-        seen_feeds.add(c)
-
-        feed = try_feed(c)
-        if feed:
-            return c, feed
-
-    return None, None
-
-# -----------------------------
-# DATE PARSING
-# -----------------------------
-def parse_date(entry):
-    for key in ["published_parsed", "updated_parsed"]:
-        v = getattr(entry, key, None)
-        if v:
-            return datetime(*v[:6], tzinfo=timezone.utc)
-
-    for key in ["published", "updated"]:
-        v = getattr(entry, key, None)
-        if v:
-            try:
-                dt = parsedate_to_datetime(v)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                return dt.astimezone(timezone.utc)
-            except:
-                pass
-    return None
+    return list(links)
 
 # -----------------------------
 # ARTICLE EXTRACTION
 # -----------------------------
 def extract_article(url):
-    html = fetch(url)
+    html = fetch_rendered(url)
     if not html:
-        return ""
-
-    return trafilatura.extract(
-        html,
-        include_comments=False,
-        include_tables=False,
-        favor_recall=True
-    ) or ""
-
-def get_summary(entry, link):
-    text = (
-        entry.get("summary")
-        or entry.get("description")
-        or (entry.content[0].value if hasattr(entry, "content") and entry.content else "")
-        or ""
-    )
-
-    text = BeautifulSoup(text, "html.parser").get_text().strip()
-
-    if not text and link:
-        return extract_article(link)
-
-    return text
-
-# -----------------------------
-# FALLBACK CRAWLER
-# -----------------------------
-def crawl_site(url, limit=10):
-    html = fetch(url)
-    if not html:
-        return []
+        return None
 
     soup = BeautifulSoup(html, "html.parser")
-    links = set()
 
-    for a in soup.find_all("a", href=True):
-        full = urljoin(url, a["href"])
+    for tag in soup(["script", "style", "nav", "footer", "header"]):
+        tag.decompose()
 
-        if urlparse(full).netloc != urlparse(url).netloc:
-            continue
+    text = "\n".join(p.get_text() for p in soup.find_all("p"))
 
-        if any(x in full.lower() for x in ["login", "signup", "tag", "category", "contact", "#"]):
-            continue
+    return text.strip() if text else None
 
-        links.add(full)
+# -----------------------------
+# RESOLVE RSS
+# -----------------------------
+def resolve_feed(url):
+    feed = try_feed(url)
+    if feed:
+        return url, feed
+    return None, None
+
+# -----------------------------
+# SITEMAP FALLBACK
+# -----------------------------
+def sitemap_fallback(url):
+    return try_sitemap(url)
+
+# -----------------------------
+# PLAYWRIGHT FALLBACK
+# -----------------------------
+def playwright_fallback(url):
+    links = extract_links_js(url)
 
     results = []
 
-    for link in list(links)[:limit]:
+    for link in links:
         link = normalize_url(link)
 
         if link in seen_articles:
@@ -259,47 +228,70 @@ def crawl_site(url, limit=10):
 with open("rss_feeds.txt") as f:
     urls = [u.strip() for u in f if u.strip()]
 
-cutoff = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-
 all_news = []
 
 for url in urls:
+
+    print(f"\n🔎 Processing: {url}")
+
+    # 1. RSS
     feed_url, feed = resolve_feed(url)
 
-    if not feed:
-        print(f"🧠 No RSS → crawling: {url}")
-        articles = crawl_site(url)
-        all_news.extend(articles)
+    if feed:
+        for entry in feed.entries:
+            link = normalize_url(entry.get("link", ""))
+
+            if link in seen_articles:
+                continue
+            seen_articles.add(link)
+
+            all_news.append({
+                "title": entry.get("title", ""),
+                "link": link,
+                "published": entry.get("published"),
+                "source": feed.feed.get("title", url),
+                "summary": entry.get("summary", "")
+            })
+
         continue
 
-    for entry in feed.entries:
-        link = normalize_url(entry.get("link", ""))
+    # 2. SITEMAP
+    print(f"🧠 No RSS → sitemap: {url}")
+    sitemap_links = sitemap_fallback(url)
 
-        if link in seen_articles:
-            continue
-        seen_articles.add(link)
+    if sitemap_links:
+        for link in sitemap_links:
+            link = normalize_url(link)
 
-        published = parse_date(entry)
+            if link in seen_articles:
+                continue
+            seen_articles.add(link)
 
-        if published and published <= cutoff:
-            continue
+            content = extract_article(link)
 
-        all_news.append({
-            "title": entry.get("title", "").strip(),
-            "link": link,
-            "published": published.isoformat() if published else None,
-            "source": getattr(feed, "feed", {}).get("title", url),
-            "summary": get_summary(entry, link)
-        })
+            if content:
+                all_news.append({
+                    "title": link.split("/")[-1],
+                    "link": link,
+                    "published": None,
+                    "source": url,
+                    "summary": content[:800]
+                })
+        continue
+
+    # 3. PLAYWRIGHT
+    print(f"🧠 No sitemap → JS crawl: {url}")
+    articles = playwright_fallback(url)
+
+    all_news.extend(articles)
 
 # -----------------------------
-# OUTPUT
+# SAVE
 # -----------------------------
-print(f"✅ Collected {len(all_news)} articles")
+print(f"\n✅ Total articles: {len(all_news)}")
 
 with open("news.json", "w", encoding="utf-8") as f:
     json.dump({
-        "cutoff": cutoff.isoformat(),
         "last_updated": datetime.now(timezone.utc).isoformat(),
         "news": all_news
     }, f, indent=2, ensure_ascii=False)
