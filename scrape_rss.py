@@ -53,12 +53,19 @@ def fetch(url):
     try:
         r = requests.get(
             url,
-            timeout=10,
-            headers={"User-Agent": "Mozilla/5.0"}
+            timeout=15,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8"
+            },
+            allow_redirects=True
         )
+
         if r.status_code != 200:
             return None
+
         return r.text
+
     except Exception:
         return None
 
@@ -99,19 +106,20 @@ def discover_rss_from_homepage(url):
         return []
 
     soup = BeautifulSoup(html, "html.parser")
-    feeds = []
+    feeds = set()
 
-    for link in soup.find_all("link", type="application/rss+xml"):
-        href = link.get("href")
-        if href:
-            feeds.append(urljoin(url, href))
+    for link in soup.find_all("link"):
+        if link.get("type") in ["application/rss+xml", "application/atom+xml"]:
+            href = link.get("href")
+            if href:
+                feeds.add(urljoin(url, href))
 
-    for link in soup.find_all("link", type="application/atom+xml"):
-        href = link.get("href")
-        if href:
-            feeds.append(urljoin(url, href))
+    # ALSO detect WordPress meta feeds
+    for a in soup.find_all("a", href=True):
+        if "rss" in a["href"] or "feed" in a["href"]:
+            feeds.add(urljoin(url, a["href"]))
 
-    return feeds
+    return list(feeds)
 
 
 # -----------------------------
